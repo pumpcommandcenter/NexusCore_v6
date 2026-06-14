@@ -739,6 +739,282 @@ Load Testing                ✓
 Security Testing            ✓
 Production Scalability      ✓
 
+Add Patch
+algorithms:
+  kem:
+    primary: ML-KEM-1024
+    fallback: X25519
+
+  signature:
+    primary: ML-DSA-87
+    fallback: Ed25519
+    US-West
+    |
+US-East
+    |
+Europe
+Frontend
+Backend
+Redis
+Postgres Replica
+Vault Replica
+API
+  |
+Circuit Breaker
+  |
+Helius
+fallback cache
+Vault
+Redis
+Helius
+Database
+Streaming
+Webhooks
+Redis Streams
+NATS
+Kafka
+Treasury events
+
+Blockchain events
+
+Audit logs
+
+Notifications
+
+Analytics
+
+Webhooks
+System Healthy
+      |
+Normal
+Read Only Mode
+Login
+
+View Streams
+
+View Wallet Data
+Treasury
+
+Admin Changes
+
+Writes
+
+Role Changes
+Request
+   |
+Risk Score
+   |
+Approval
+Amount
+
+Destination
+
+Signer Reputation
+
+Velocity
+
+Anomaly Detection
+Vault Loss
+
+Database Loss
+
+Redis Loss
+
+Node Loss
+
+Region Loss
+Quarterly External Pentest
+
+Monthly Internal Review
+Wallet Auth
+
+Treasury
+
+WebSockets
+
+OPA Policies
+
+Vault Access
+
+API Gateway
+Wallet
+
+Treasury
+
+Streaming
+
+Database
+
+Crypto
+
+Infrastructure
+Falco
+
+Tetragon
+
+eBPF Monitoring
+Unexpected Shells
+
+Privilege Escalation
+
+Container Escape
+
+Secret Access
+Wallet logins
+
+Treasury activity
+
+API spikes
+
+WebSocket abuse
+
+Stream abuse
+Rust Crates
+
+NPM Packages
+
+Containers
+
+OS Packages
+Owner
+
+Version
+
+Risk Rating
+
+Upgrade Plan
+streaming_enabled
+
+treasury_enabled
+
+webhooks_enabled
+
+helius_enabled
+
+new_wallet_auth_enabled
+Disable Feature
+Wallet Login
+< 250ms
+
+JWT Verification
+< 20ms
+
+API Requests
+< 150ms
+
+WebSocket Publish
+< 50ms
+
+Stream Join
+< 1s
+10 users
+
+100 users
+
+1,000 users
+
+10,000 users
+
+100,000 users
+
+1,000,000 users
+CPU
+
+Memory
+
+Bandwidth
+
+Storage
+
+Database IOPS
+Audit Trails
+
+Access Logs
+
+Key Rotations
+
+Approvals
+
+Incident Reports
+Latency
+
+Traffic
+
+Errors
+
+Saturation
+Wallet Auth Success
+
+Treasury Activity
+
+PQC Handshakes
+
+Vault Status
+
+Redis Health
+
+Database Health
+
+Helius Health
+
+Stream Health
+✓ Vault Offline
+
+✓ Redis Offline
+
+✓ Postgres Offline
+
+✓ Helius Offline
+
+✓ WebSocket Cluster Offline
+
+✓ Mediasoup Node Offline
+
+✓ Kubernetes Node Failure
+
+✓ Region Failure
+
+✓ TLS Certificate Expiry
+
+✓ Key Rotation Event
+
+✓ Treasury Signer Unavailable
+
+✓ API Gateway Failure
+
+✓ DNS Failure
+
+✓ Feature Flag Failure
+
+✓ OPA Failure
+No data loss
+
+Automatic failover
+
+Alert generated
+
+Recovery documented
+
+Recovery validated
+Security Audit Passed
+Penetration Test Passed
+Load Test Passed
+Chaos Test Passed
+Disaster Recovery Tested
+Key Rotation Tested
+Treasury Controls Tested
+OPA Policies Verified
+Supply Chain Verification Enabled
+Observability Complete
+
+
+
+
+
+
+
+    
+    
  
 
 
