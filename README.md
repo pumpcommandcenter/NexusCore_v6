@@ -1095,6 +1095,796 @@ Recoverable
 
 Future Proof
 
++
+rust-helius-service/
+├── Cargo.toml
+├── Dockerfile
+├── .env.example
+├── src/
+│   ├── main.rs
+│   ├── lib.rs
+│   ├── cache.rs
+│   ├── handlers/
+│   │   ├── mod.rs
+│   │   ├── assets.rs
+│   │   ├── transactions.rs
+│   │   ├── withdraw.rs
+│   │   └── metrics.rs
+│   └── websocket.rs
+[package]
+name = "helius-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+helius = { version = "0.3", default-features = false, features = ["rustls"] }
+solana-sdk = "1.18"
+solana-client = "1.18"
+spl-token-2022 = "3.0"
+prometheus = "0.13"
+lazy_static = "1.4"
+moka = { version = "0.12", features = ["future"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1.0"
+dotenvy = "0.15"
+HELIUS_API_KEY=your_helius_key
+LUMINEX_MINT=EyCMRsiSxbLRspptLHNqqMQG8HB2oTZSPWRyWJqXpump
+TREASURY_TOKEN_ACCOUNT=PUT_REAL_TREASURY_ATA_HERE
+TREASURY_AUTHORITY=PUT_REAL_AUTHORITY_HERE
+SQUADS_MULTISIG=PUT_REAL_SQUADS_PDA_HERE
+SQUADS_VAULT=PUT_REAL_SQUADS_VAULT_HERE
+RPC_URL=https://api.mainnet-beta.solana.com
+use axum::{routing::{get, post}, Router};
+use dotenvy::dotenv;
+use std::sync::Arc;
+use tokio::sync::broadcast;
+use tracing::info;
+
+mod cache;
+mod handlers;
+mod websocket;
+
+use handlers::metrics::Metrics;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub helius: helius::Helius,
+    pub broadcast_tx: broadcast::Sender<serde_json::Value>,
+    pub das_cache: moka::future::Cache<String, serde_json::Value>,
+    pub metrics: Arc<Metrics>,
+}
+
+#[tokio::main]
+async fn main() {
+    dotenv().ok();
+    tracing_subscriber::fmt::init();
+
+    let helius = helius::Helius::new(
+        &std::env::var("HELIUS_API_KEY").unwrap(),
+        helius::types::Cluster::MainnetBeta,
+    ).expect("Failed to create Helius client");
+
+    let (tx, _rx) = broadcast::channel(100);
+    let das_cache = cache::create_das_cache();
+    let metrics = Arc::new(Metrics::default());
+
+    let state = AppState {
+        helius,
+        broadcast_tx: tx.clone(),
+        das_cache,
+        metrics,
+    };
+
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/metrics", get(handlers::metrics::metrics_handler))
+        .route("/assets/owner", post(handlers::assets::get_assets_by_owner))
+        .route("/assets/search", post(handlers::assets::search_assets))
+        .route("/assets/proof", post(handlers::assets::get_asset_proof))
+        .route("/transactions/parse", post(handlers::transactions::parse_transactions))
+        .route("/withdraw/luminex", post(handlers::withdraw::withdraw_luminex))
+        .route("/ws/helius", get(websocket::helius_ws_handler))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    info!("🚀 Helius Microservice running on port 8080");
+    axum::serve(listener, app).await.unwrap();
+}
+use axum::{extract::State, Json};
+use serde::Deserialize;
+use solana_sdk::pubkey::Pubkey;
+use spl_token_2022::instruction::transfer_checked;
+use std::str::FromStr;
+use std::env;
+
+#[derive(Deserialize)]
+pub struct WithdrawRequest {
+    pub destination: String,
+    pub amount: u64,
+}
+
+pub async fn withdraw_luminex(
+    Json(payload): Json<WithdrawRequest>,
+) -> Json<serde_json::Value> {
+    let destination = Pubkey::from_str(&payload.destination).unwrap();
+    let treasury_ata = Pubkey::from_str(&env::var("TREASURY_TOKEN_ACCOUNT").unwrap()).unwrap();
+    let luminex_mint = Pubkey::from_str(&env::var("LUMINEX_MINT").unwrap()).unwrap();
+    let authority = Pubkey::from_str(&env::var("TREASURY_AUTHORITY").unwrap()).unwrap();
+
+    let transfer_ix = transfer_checked(
+        &spl_token_2022::id(),
+        &treasury_ata,
+        &luminex_mint,
+        &destination,
+        &authority,
+        &[],
+        payload.amount,
+        6,
+    ).unwrap();
+
+    Json(serde_json::json!({
+        "success": true,
+        "instruction": format!("{:?}", transfer_ix),
+        "message": "Instruction ready. Use with Squads to create proposal."
+    }))
+}
+import { Connection, PublicKey, TransactionInstruction } from '@solana/web3.js';
+import { Multisig } from '@sqds/sdk';
+
+export async function createSquadsProposalFromRustInstruction(
+  instruction: TransactionInstruction,
+  creator: PublicKey
+) {
+  const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC!);
+  const multisigPda = new PublicKey(process.env.SQUADS_MULTISIG!);
+
+  const multisig = await Multisig.fromAccountAddress(connection, multisigPda);
+
+  const proposalIx = await multisig.createTransaction({
+    multisigPda,
+    transactionIndex: await multisig.getNextTransactionIndex(),
+    creator,
+    instructions: [instruction],
+  });
+
+  return proposalIx;
+}
+// 1. Call Rust service
+const res = await fetch('http://localhost:8080/withdraw/luminex', {
+  method: 'POST',
+  body: JSON.stringify({ destination, amount }),
+});
+const { instruction } = await res.json();
+
+// 2. Create real Squads proposal
+const proposalIx = await createSquadsProposalFromRustInstruction(instruction, publicKey);
+use axum::{extract::State, Json};
+use serde::Deserialize;
+use solana_sdk::{
+    instruction::Instruction,
+    pubkey::Pubkey,
+};
+use spl_token_2022::instruction::transfer_checked;
+use std::str::FromStr;
+use std::env;
+
+#[derive(Deserialize)]
+pub struct WithdrawRequest {
+    pub destination: String,
+    pub amount: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct InstructionResponse {
+    pub success: bool,
+    pub program_id: String,
+    pub accounts: Vec<serde_json::Value>,
+    pub data: String, // base64 encoded
+}
+
+pub async fn withdraw_luminex(
+    Json(payload): Json<WithdrawRequest>,
+) -> Json<InstructionResponse> {
+    let destination = Pubkey::from_str(&payload.destination).unwrap();
+    let treasury_ata = Pubkey::from_str(&env::var("TREASURY_TOKEN_ACCOUNT").unwrap()).unwrap();
+    let luminex_mint = Pubkey::from_str(&env::var("LUMINEX_MINT").unwrap()).unwrap();
+    let authority = Pubkey::from_str(&env::var("TREASURY_AUTHORITY").unwrap()).unwrap();
+
+    let transfer_ix: Instruction = transfer_checked(
+        &spl_token_2022::id(),
+        &treasury_ata,
+        &luminex_mint,
+        &destination,
+        &authority,
+        &[],
+        payload.amount,
+        6,
+    ).unwrap();
+
+    // Convert to serializable format for TypeScript
+    let accounts: Vec<serde_json::Value> = transfer_ix.accounts.iter().map(|acc| {
+        serde_json::json!({
+            "pubkey": acc.pubkey.to_string(),
+            "is_signer": acc.is_signer,
+            "is_writable": acc.is_writable,
+        })
+    }).collect();
+
+    Json(InstructionResponse {
+        success: true,
+        program_id: transfer_ix.program_id.to_string(),
+        accounts,
+        data: base64::encode(&transfer_ix.data),
+    })
+}
+import { Connection, PublicKey, TransactionInstruction } from '@solana/web3.js';
+import { Multisig } from '@sqds/sdk';
+
+interface RustInstruction {
+  program_id: string;
+  accounts: Array<{
+    pubkey: string;
+    is_signer: boolean;
+    is_writable: boolean;
+  }>;
+  data: string; // base64
+}
+
+export async function createLuminexWithdrawalProposal(
+  rustInstruction: RustInstruction,
+  creator: PublicKey
+) {
+  const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC!);
+  const multisigPda = new PublicKey(process.env.SQUADS_MULTISIG!);
+
+  // Rebuild the instruction from Rust response
+  const instruction = new TransactionInstruction({
+    programId: new PublicKey(rustInstruction.program_id),
+    keys: rustInstruction.accounts.map((acc) => ({
+      pubkey: new PublicKey(acc.pubkey),
+      isSigner: acc.is_signer,
+      isWritable: acc.is_writable,
+    })),
+    data: Buffer.from(rustInstruction.data, 'base64'),
+  });
+
+  const multisig = await Multisig.fromAccountAddress(connection, multisigPda);
+
+  const proposalIx = await multisig.createTransaction({
+    multisigPda,
+    transactionIndex: await multisig.getNextTransactionIndex(),
+    creator,
+    instructions: [instruction],
+  });
+
+  return proposalIx;
+}
+const handleWithdraw = async () => {
+  if (!publicKey) return;
+
+  setTradeStatus('Building withdrawal instruction...');
+
+  try {
+    // Step 1: Call Rust Microservice
+    const rustRes = await fetch('http://localhost:8080/withdraw/luminex', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        destination: publicKey.toBase58(), // or any destination
+        amount: 100_000_000, // 100 LUMINEX
+      }),
+    });
+
+    const instructionData = await rustRes.json();
+
+    if (!instructionData.success) throw new Error(instructionData.error);
+
+    setTradeStatus('Creating Squads proposal...');
+
+    // Step 2: Send to TypeScript backend to create real Squads proposal
+    const proposalRes = await fetch('/api/create-withdrawal-proposal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        instruction: instructionData,
+        creator: publicKey.toBase58(),
+      }),
+    });
+
+    const { signature } = await proposalRes.json();
+
+    setTradeStatus(`✅ Squads proposal created! Tx: ${signature.slice(0, 8)}...`);
+  } catch (err: any) {
+    setTradeStatus(`❌ Error: ${err.message}`);
+  }
+};
+nexuscore-command-center/
+├── frontend/
+├── backend/
+│   └── src/
+│       └── utils/
+│           └── create-luminex-withdrawal.ts     ← New
+├── rust-helius-service/                         ← Full service
+│   ├── src/
+│   │   ├── handlers/
+│   │   │   └── withdraw.rs                      ← Instruction builder
+│   │   └── main.rs
+│   └── Dockerfile
+└── docker/
+    └── docker-compose.base44.yml
+use axum::{extract::State, http::StatusCode, Json};
+use serde::Deserialize;
+use solana_sdk::pubkey::Pubkey;
+use spl_token_2022::instruction::transfer_checked;
+use std::str::FromStr;
+use std::env;
+
+#[derive(Deserialize)]
+pub struct WithdrawRequest {
+    pub destination: String,
+    pub amount: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct ErrorResponse {
+    pub success: bool,
+    pub error: String,
+}
+
+pub async fn withdraw_luminex(
+    Json(payload): Json<WithdrawRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    // Parse destination address
+    let destination = Pubkey::from_str(&payload.destination).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                success: false,
+                error: "Invalid destination wallet address".to_string(),
+            }),
+        )
+    })?;
+
+    // Load environment variables with proper error handling
+    let treasury_ata_str = env::var("TREASURY_TOKEN_ACCOUNT").map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: "TREASURY_TOKEN_ACCOUNT not configured".to_string(),
+            }),
+        )
+    })?;
+
+    let luminex_mint_str = env::var("LUMINEX_MINT").map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: "LUMINEX_MINT not configured".to_string(),
+            }),
+        )
+    })?;
+
+    let authority_str = env::var("TREASURY_AUTHORITY").map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: "TREASURY_AUTHORITY not configured".to_string(),
+            }),
+        )
+    })?;
+
+    // Parse environment Pubkeys
+    let treasury_ata = Pubkey::from_str(&treasury_ata_str).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: "Invalid TREASURY_TOKEN_ACCOUNT in environment".to_string(),
+            }),
+        )
+    })?;
+
+    let luminex_mint = Pubkey::from_str(&luminex_mint_str).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: "Invalid LUMINEX_MINT in environment".to_string(),
+            }),
+        )
+    })?;
+
+    let authority = Pubkey::from_str(&authority_str).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: "Invalid TREASURY_AUTHORITY in environment".to_string(),
+            }),
+        )
+    })?;
+
+    // Build the transfer instruction
+    let transfer_ix = transfer_checked(
+        &spl_token_2022::id(),
+        &treasury_ata,
+        &luminex_mint,
+        &destination,
+        &authority,
+        &[],
+        payload.amount,
+        6,
+    ).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: format!("Failed to create transfer instruction: {}", e),
+            }),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "LUMINEX withdrawal instruction created successfully",
+        "program_id": transfer_ix.program_id.to_string(),
+        "accounts": transfer_ix.accounts.iter().map(|acc| {
+            serde_json::json!({
+                "pubkey": acc.pubkey.to_string(),
+                "is_signer": acc.is
+LUMINEX_MINT=EyCMRsiSxbLRspptLHNqqMQG8HB2oTZSPWRyWJqXpump
+TREASURY_TOKEN_ACCOUNT=YourRealTreasuryATA
+TREASURY_AUTHORITY=YourRealAuthorityPubkey          # Usually the Squads vault
+SQUADS_MULTISIG=YourRealSquadsMultisigPda
+SQUADS_VAULT=YourRealSquadsVault
+rust-helius-service/
+├── Cargo.toml
+├── Dockerfile
+├── .env.example
+├── src/
+│   ├── main.rs
+│   ├── lib.rs
+│   ├── cache.rs
+│   ├── handlers/
+│   │   ├── mod.rs
+│   │   ├── assets.rs          # With Moka caching
+│   │   ├── transactions.rs    # With parsing + enrichment
+│   │   ├── withdraw.rs        # ← Updated with validation + rate limiting
+│   │   └── metrics.rs         # Prometheus metrics
+│   └── websocket.rs           # Real broadcasting
+└── src/handlers/withdraw.rs   # Main file updated below
+use axum::{extract::State, http::StatusCode, Json};
+use serde::Deserialize;
+use solana_sdk::pubkey::Pubkey;
+use spl_token_2022::instruction::transfer_checked;
+use std::str::FromStr;
+use std::env;
+
+#[derive(Deserialize)]
+pub struct WithdrawRequest {
+    pub destination: String,
+    pub amount: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct ErrorResponse {
+    pub success: bool,
+    pub error: String,
+}
+
+// Amount validation constants (LUMINEX has 6 decimals)
+const MIN_WITHDRAW: u64 = 1_000_000;           // 1 LUMINEX
+const MAX_WITHDRAW: u64 = 1_000_000_000_000;   // 1,000,000 LUMINEX
+
+pub async fn withdraw_luminex(
+    Json(payload): Json<WithdrawRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    
+    // === Amount Validation ===
+    if payload.amount < MIN_WITHDRAW {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                success: false,
+                error: format!("Minimum withdrawal is {} LUMINEX", MIN_WITHDRAW / 1_000_000),
+            }),
+        ));
+    }
+
+    if payload.amount > MAX_WITHDRAW {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                success: false,
+                error: format!("Maximum withdrawal is {} LUMINEX", MAX_WITHDRAW / 1_000_000),
+            }),
+        ));
+    }
+
+    // === Pubkey Parsing with Error Handling ===
+    let destination = Pubkey::from_str(&payload.destination).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                success: false,
+                error: "Invalid destination wallet address".to_string(),
+            }),
+        )
+    })?;
+
+    let treasury_ata_str = env::var("TREASURY_TOKEN_ACCOUNT").map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: "TREASURY_TOKEN_ACCOUNT not configured".to_string(),
+            }),
+        )
+    })?;
+
+    let treasury_ata = Pubkey::from_str(&treasury_ata_str).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: "Invalid TREASURY_TOKEN_ACCOUNT in environment".to_string(),
+            }),
+        )
+    })?;
+
+    let luminex_mint = Pubkey::from_str(&env::var("LUMINEX_MINT").unwrap()).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: "Invalid LUMINEX_MINT".to_string(),
+            }),
+        )
+    })?;
+
+    let authority = Pubkey::from_str(&env::var("TREASURY_AUTHORITY").unwrap()).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: "Invalid TREASURY_AUTHORITY".to_string(),
+            }),
+        )
+    })?;
+
+    // Build transfer instruction
+    let transfer_ix = transfer_checked(
+        &spl_token_2022::id(),
+        &treasury_ata,
+        &luminex_mint,
+        &destination,
+        &authority,
+        &[],
+        payload.amount,
+        6,
+    ).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: format!("Failed to create instruction: {}", e),
+            }),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "LUMINEX withdrawal instruction created",
+        "amount_luminex": payload.amount / 1_000_000,
+        "program_id": transfer_ix.program_id.to_string(),
+        "accounts": transfer_ix.accounts.iter().map(|acc| {
+            serde_json::json!({
+                "pubkey": acc.pubkey.to_string(),
+                "is_signer": acc.is_signer,
+                "is_writable": acc.is_writable
+            })
+        }).collect::<Vec<_>>(),
+        "data": base64::encode(&transfer_ix.data)
+    })))
+}
+use tower_http::limit::RateLimitLayer;
+use std::time::Duration;
+
+let app = Router::new()
+    // ... other routes
+    .route("/withdraw/luminex", post(handlers::withdraw::withdraw_luminex)
+        .layer(RateLimitLayer::new(5, Duration::from_secs(60)))) // 5 requests per minute
+    // ...
+;
+rust-helius-service/
+├── Cargo.toml
+├── Dockerfile
+├── .env.example
+├── src/
+│   ├── main.rs
+│   ├── lib.rs
+│   ├── cache.rs
+│   ├── handlers/
+│   │   ├── mod.rs
+│   │   ├── assets.rs
+│   │   ├── transactions.rs
+│   │   ├── withdraw.rs          ← Updated with validation + RPC error handling
+│   │   └── metrics.rs
+│   └── websocket.rs
+└── src/handlers/withdraw.rs
+[package]
+name = "helius-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+helius = { version = "0.3", default-features = false, features = ["rustls"] }
+solana-sdk = "1.18"
+solana-client = "1.18"
+spl-token-2022 = "3.0"
+prometheus = "0.13"
+lazy_static = "1.4"
+moka = { version = "0.12", features = ["future"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1.0"
+dotenvy = "0.15"
+tower-http = { version = "0.5", features = ["limit"] }
+base64 = "0.21"
+use axum::{extract::State, http::StatusCode, Json};
+use serde::Deserialize;
+use solana_sdk::pubkey::Pubkey;
+use spl_token_2022::instruction::transfer_checked;
+use std::str::FromStr;
+use std::env;
+
+#[derive(Deserialize)]
+pub struct WithdrawRequest {
+    pub destination: String,
+    pub amount: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct ErrorResponse {
+    pub success: bool,
+    pub error: String,
+}
+
+// Amount validation
+const MIN_WITHDRAW: u64 = 1_000_000;           // 1 LUMINEX
+const MAX_WITHDRAW: u64 = 1_000_000_000_000;   // 1M LUMINEX
+
+pub async fn withdraw_luminex(
+    Json(payload): Json<WithdrawRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    
+    // === Amount Validation ===
+    if payload.amount < MIN_WITHDRAW {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                success: false,
+                error: format!("Minimum withdrawal is {} LUMINEX", MIN_WITHDRAW / 1_000_000),
+            }),
+        ));
+    }
+
+    if payload.amount > MAX_WITHDRAW {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                success: false,
+                error: format!("Maximum withdrawal is {} LUMINEX", MAX_WITHDRAW / 1_000_000),
+            }),
+        ));
+    }
+
+    // === Safe Pubkey Parsing ===
+    let destination = Pubkey::from_str(&payload.destination).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                success: false,
+                error: "Invalid destination wallet address".to_string(),
+            }),
+        )
+    })?;
+
+    // Load env vars safely
+    let treasury_ata = env::var("TREASURY_TOKEN_ACCOUNT")
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+            success: false,
+            error: "TREASURY_TOKEN_ACCOUNT not set".to_string(),
+        })))?;
+
+    let treasury_ata = Pubkey::from_str(&treasury_ata).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: "Invalid TREASURY_TOKEN_ACCOUNT".to_string(),
+            }),
+        )
+    })?;
+
+    let luminex_mint = Pubkey::from_str(&env::var("LUMINEX_MINT").unwrap()).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: "Invalid LUMINEX_MINT".to_string(),
+            }),
+        )
+    })?;
+
+    let authority = Pubkey::from_str(&env::var("TREASURY_AUTHORITY").unwrap()).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: "Invalid TREASURY_AUTHORITY".to_string(),
+            }),
+        )
+    })?;
+
+    // Build instruction
+    let transfer_ix = transfer_checked(
+        &spl_token_2022::id(),
+        &treasury_ata,
+        &luminex_mint,
+        &destination,
+        &authority,
+        &[],
+        payload.amount,
+        6,
+    ).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: format!("Failed to create transfer instruction: {}", e),
+            }),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "LUMINEX withdrawal instruction created successfully",
+        "amount_luminex": payload.amount / 1_000_000,
+        "program_id": transfer_ix.program_id.to_string(),
+        "accounts": transfer_ix.accounts.iter().map(|acc| {
+            serde_json::json!({
+                "pubkey": acc.pubkey.to_string(),
+                "is_signer": acc.is_signer,
+                "is_writable": acc.is_writable
+            })
+        }).collect::<Vec<_>>(),
+        "data": base64::encode(&transfer_ix.data)
+    })))
+}
+use solana_client::client_error::ClientError;
+
+match client.send_and_confirm_transaction(&tx) {
+    Ok(sig) => { /* success */ }
+    Err(ClientError::TransactionError(e)) => {
+        // Handle specific errors like InsufficientFunds, AccountNotFound, etc.
+    }
+    Err(e) => { /* generic error */ }
+}
+.route("/withdraw/luminex", post(handlers::withdraw::withdraw_luminex)
+    .layer(tower_http::limit::RateLimitLayer::new(5, std::time::Duration::from_secs(60))))
 
 
 
