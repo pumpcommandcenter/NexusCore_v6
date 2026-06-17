@@ -1885,6 +1885,1096 @@ match client.send_and_confirm_transaction(&tx) {
 }
 .route("/withdraw/luminex", post(handlers::withdraw::withdraw_luminex)
     .layer(tower_http::limit::RateLimitLayer::new(5, std::time::Duration::from_secs(60))))
+backend/src/services/
+├── tokenTerminal.ts          # New - Token Terminal API client
+├── multiChainWallet.ts       # New - Multi-chain signature verification
+└── helius.ts                 # Already exists (calls Rust service)
+import axios from 'axios';
+
+const TOKEN_TERMINAL_API_KEY = process.env.TOKEN_TERMINAL_API_KEY;
+const BASE_URL = 'https://api.tokenterminal.com/v2';
+
+const tokenTerminalClient = axios.create({
+  baseURL: BASE_URL,
+  headers: {
+    Authorization: `Bearer ${TOKEN_TERMINAL_API_KEY}`,
+  },
+});
+
+export async function getProtocolMetrics(slug: string) {
+  try {
+    const { data } = await tokenTerminalClient.get(`/protocols/${slug}/metrics`);
+    return data;
+  } catch (error) {
+    console.error(`[TokenTerminal] Failed to fetch metrics for ${slug}`, error);
+    return null;
+  }
+}
+
+export async function getTopProtocolsByRevenue(limit = 10) {
+  try {
+    const { data } = await tokenTerminalClient.get('/protocols', {
+      params: { sort_by: 'revenue', limit },
+    });
+    return data;
+  } catch (error) {
+    console.error('[TokenTerminal] Failed to fetch top protocols', error);
+    return [];
+  }
+}
+import express from 'express';
+import { getTopProtocolsByRevenue, getProtocolMetrics } from '../services/tokenTerminal';
+
+const router = express.Router();
+
+router.get('/protocols/top', async (req, res) => {
+  const data = await getTopProtocolsByRevenue(15);
+  res.json({ success: true, data });
+});
+
+router.get('/protocols/:slug', async (req, res) => {
+  const { slug } = req.params;
+  const data = await getProtocolMetrics(slug);
+  res.json({ success: !!data, data });
+});
+
+export default router;
+import metricsRouter from './routes/metrics';
+app.use('/api/metrics', metricsRouter);
+import { verifyMessage as verifyEvmMessage } from 'viem';
+import * as ed from '@noble/ed25519';
+
+// Verify EVM signature (Ethereum, Base, etc.)
+export async function verifyEvmSignature(
+  message: string,
+  signature: string,
+  address: string
+): Promise<boolean> {
+  try {
+    return await verifyEvmMessage({ address: address as `0x${string}`, message, signature: signature as `0x${string}` });
+  } catch {
+    return false;
+  }
+}
+
+// Verify Solana signature
+export async function verifySolanaSignature(
+  message: string,
+  signature: string,
+  publicKey: string
+): Promise<boolean> {
+  try {
+    const messageBytes = new TextEncoder().encode(message);
+    const signatureBytes = Buffer.from(signature, 'base64');
+    const publicKeyBytes = Buffer.from(publicKey, 'base64');
+
+    return await ed.verify(signatureBytes, messageBytes, publicKeyBytes);
+  } catch {
+    return false;
+  }
+}
+import axios from 'axios';
+import { getCache, setCache } from '../utils/redis';
+
+const TOKEN_TERMINAL_API_KEY = process.env.TOKEN_TERMINAL_API_KEY;
+const BASE_URL = 'https://api.tokenterminal.com/v2';
+
+const client = axios.create({
+  baseURL: BASE_URL,
+  headers: {
+    Authorization: `Bearer ${TOKEN_TERMINAL_API_KEY}`,
+  },
+  timeout: 10000,
+});
+
+interface ProtocolMetrics {
+  revenue: number;
+  fees: number;
+  tvl: number;
+  active_users: number;
+  [key: string]: any;
+}
+
+/**
+ * Get protocol metrics with Redis caching (5 min TTL)
+ */
+export async function getProtocolMetrics(slug: string): Promise<ProtocolMetrics | null> {
+  const cacheKey = `tokenterminal:protocol:${slug}`;
+
+  const cached = await getCache<ProtocolMetrics>(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const { data } = await client.get(`/protocols/${slug}/metrics`);
+    await setCache(cacheKey, data, 300); // 5 minutes
+    return data;
+  } catch (error) {
+    console.error(`[TokenTerminal] Failed to fetch ${slug}:`, error);
+    return null;
+  }
+}
+
+/**
+ * Get top protocols by revenue (cached 10 min)
+ */
+export async function getTopProtocolsByRevenue(limit = 20) {
+  const cacheKey = `tokenterminal:top:revenue:${limit}`;
+
+  const cached = await getCache(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const { data } = await client.get('/protocols', {
+      params: { sort_by: 'revenue', limit },
+    });
+    await setCache(cacheKey, data, 600); // 10 minutes
+    return data;
+  } catch (error) {
+    console.error('[TokenTerminal] Failed to fetch top protocols:', error);
+    return [];
+  }
+}
+import { verifyMessage } from 'viem';
+import * as ed from '@noble/ed25519';
+
+export interface MultiChainSignature {
+  chain: 'solana' | 'ethereum' | 'base' | 'bsc';
+  message: string;
+  signature: string;
+  address: string;
+}
+
+/**
+ * Verify EVM signature (Ethereum, Base, BSC, etc.)
+ */
+export async function verifyEvmSignature(
+  message: string,
+  signature: string,
+  address: string
+): Promise<boolean> {
+  try {
+    return await verifyMessage({
+      address: address as `0x${string}`,
+      message,
+      signature: signature as `0x${string}`,
+    });
+  } catch (error) {
+    console.error('[MultiChain] EVM verification failed:', error);
+    return false;
+  }
+}
+
+/**
+ * Verify Solana signature
+ */
+export async function verifySolanaSignature(
+  message: string,
+  signature: string,
+  publicKey: string
+): Promise<boolean> {
+  try {
+    const messageBytes = new TextEncoder().encode(message);
+    const signatureBytes = Buffer.from(signature, 'base64');
+    const publicKeyBytes = Buffer.from(publicKey, 'base64');
+
+    return await ed.verify(signatureBytes, messageBytes, publicKeyBytes);
+  } catch (error) {
+    console.error('[MultiChain] Solana verification failed:', error);
+    return false;
+  }
+}
+
+/**
+ * Unified multi-chain signature verification
+ */
+export async function verifyMultiChainSignature(
+  data: MultiChainSignature
+): Promise<boolean> {
+  const { chain, message, signature, address } = data;
+
+  if (chain === 'solana') {
+    return verifySolanaSignature(message, signature, address);
+  }
+
+  // EVM chains
+  if (['ethereum', 'base', 'bsc'].includes(chain)) {
+    return verifyEvmSignature(message, signature, address);
+  }
+
+  return false;
+}
+import express from 'express';
+import { verifyMultiChainSignature } from '../services/multiChainWallet';
+import { createLuminexWithdrawalProposal } from '../utils/create-luminex-withdrawal';
+
+const router = express.Router();
+
+router.post('/luminex', async (req, res, next) => {
+  try {
+    const { destination, amount, creator, chain, signature, message } = req.body;
+
+    // Multi-chain signature verification for high-value actions
+    if (signature && message) {
+      const isValid = await verifyMultiChainSignature({
+        chain: chain || 'solana',
+        message,
+        signature,
+        address: creator,
+      });
+
+      if (!isValid) {
+        return res.status(401).json({
+          success: false,
+          error: 'Invalid multi-chain signature',
+        });
+      }
+    }
+
+    // Call Rust microservice
+    const rustRes = await fetch('http://helius-service:8080/withdraw/luminex', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ destination, amount }),
+    });
+
+    const instructionData = await rustRes.json();
+
+    if (!instructionData.success) {
+      return res.status(400).json(instructionData);
+    }
+
+    // Create Squads proposal
+    const proposal = await createLuminexWithdrawalProposal(instructionData, creator);
+
+    res.json({
+      success: true,
+      message: 'Multi-chain withdrawal proposal created',
+      proposal,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+export default router;
+import express from 'express';
+import { getTopProtocolsByRevenue, getProtocolMetrics } from '../services/tokenTerminal';
+import { getCache, setCache } from '../utils/redis';
+
+const router = express.Router();
+
+router.get('/protocols/top', async (req, res) => {
+  const cacheKey = 'metrics:protocols:top';
+  const cached = await getCache(cacheKey);
+
+  if (cached) return res.json({ success: true, data: cached, cached: true });
+
+  const data = await getTopProtocolsByRevenue(20);
+  await setCache(cacheKey, data, 600); // 10 min cache
+
+  res.json({ success: true, data });
+});
+
+router.get('/protocols/:slug', async (req, res) => {
+  const { slug } = req.params;
+  const cacheKey = `metrics:protocol:${slug}`;
+
+  const cached = await getCache(cacheKey);
+  if (cached) return res.json({ success: true, data: cached, cached: true });
+
+  const data = await getProtocolMetrics(slug);
+  if (!data) {
+    return res.status(404).json({ success: false, error: 'Protocol not found' });
+  }
+
+  await setCache(cacheKey, data, 300);
+  res.json({ success: true, data });
+});
+
+export default router;
+// ... existing code ...
+
+/**
+ * Invalidate cache by exact key
+ */
+export async function invalidateCache(key: string): Promise<void> {
+  try {
+    await redis.del(key);
+    console.log(`[Redis] Invalidated key: ${key}`);
+  } catch (error) {
+    console.error(`[Redis] Failed to invalidate key: ${key}`, error);
+  }
+}
+
+/**
+ * Invalidate multiple keys at once
+ */
+export async function invalidateMultipleCache(keys: string[]): Promise<void> {
+  if (keys.length === 0) return;
+  try {
+    await redis.del(...keys);
+    console.log(`[Redis] Invalidated ${keys.length} keys`);
+  } catch (error) {
+    console.error('[Redis] Failed to invalidate multiple keys', error);
+  }
+}
+
+/**
+ * Write-through cache update (update cache + invalidate related patterns)
+ */
+export async function writeThroughCache(
+  key: string,
+  value: any,
+  ttlSeconds = 300,
+  relatedPatterns: string[] = []
+): Promise<void> {
+  try {
+    await redis.setex(key, ttlSeconds, JSON.stringify(value));
+    
+    // Invalidate related patterns
+    for (const pattern of relatedPatterns) {
+      await invalidateCacheByPattern(pattern);
+    }
+  } catch (error) {
+    console.error(`[Redis] Write-through cache failed for key: ${key}`, error);
+  }
+}
+
+/**
+ * Event-based invalidation (call after important state changes)
+ */
+export async function invalidateOnEvent(event: string, relatedKeys: string[] = []): Promise<void> {
+  console.log(`[Redis] Event-based invalidation triggered: ${event}`);
+  
+  // Invalidate all related cache keys
+  for (const key of relatedKeys) {
+    await invalidateCache(key);
+  }
+  
+  // You can also publish to Redis Pub/Sub for distributed invalidation
+  await pub.publish('cache:invalidation', JSON.stringify({ event, keys: relatedKeys }));
+}
+// After writing new data (example)
+export async function refreshProtocolMetrics(slug: string) {
+  const cacheKey = `tokenterminal:protocol:${slug}`;
+  
+  // Invalidate old cache
+  await invalidateCache(cacheKey);
+  
+  // Fetch fresh data and write-through
+  const freshData = await getProtocolMetricsFromAPI(slug);
+  await writeThroughCache(cacheKey, freshData, 300, [`tokenterminal:protocol:*`]);
+}
+import * as ed from '@noble/ed25519';
+import { PublicKey } from '@solana/web3.js';
+
+export interface SolanaSignaturePayload {
+  message: string;
+  signature: string;
+  publicKey: string;
+}
+
+/**
+ * Verify a Solana message signature
+ */
+export async function verifySolanaSignature({
+  message,
+  signature,
+  publicKey,
+}: SolanaSignaturePayload): Promise<boolean> {
+  try {
+    const messageBytes = new TextEncoder().encode(message);
+    const signatureBytes = Buffer.from(signature, 'base64');
+    const publicKeyBytes = new PublicKey(publicKey).toBytes();
+
+    return await ed.verify(signatureBytes, messageBytes, publicKeyBytes);
+  } catch (error) {
+    console.error('[Solana Verification] Signature verification failed:', error);
+    return false;
+  }
+}
+
+/**
+ * Verify + extract signer (useful for high-value actions)
+ */
+export async function verifyAndGetSigner(payload: SolanaSignaturePayload): Promise<string | null> {
+  const isValid = await verifySolanaSignature(payload);
+  return isValid ? payload.publicKey : null;
+}
+
+/**
+ * Verify Solana signature with additional context (recommended for production)
+ */
+export async function verifySolanaAction(
+  payload: SolanaSignaturePayload,
+  expectedAction?: string
+): Promise<{ valid: boolean; signer?: string }> {
+  const isValid = await verifySolanaSignature(payload);
+  
+  if (!isValid) {
+    return { valid: false };
+  }
+
+  // Optional: Add action-specific checks (e.g., timestamp, nonce)
+  if (expectedAction && !payload.message.includes(expectedAction)) {
+    return { valid: false };
+  }
+
+  return {
+    valid: true,
+    signer: payload.publicKey,
+  };
+}
+import * as ed from '@noble/ed25519';
+import { PublicKey } from '@solana/web3.js';
+import { getCache, setCache } from '../utils/redis';
+
+export interface SolanaSignaturePayload {
+  message: string;
+  signature: string;
+  publicKey: string;
+}
+
+const NONCE_TTL_SECONDS = 300; // 5 minutes
+
+/**
+ * Verify Solana signature with Timestamp + Nonce validation
+ */
+export async function verifySolanaActionWithNonce(
+  payload: SolanaSignaturePayload,
+  expectedAction?: string
+): Promise<{ valid: boolean; signer?: string; error?: string }> {
+  try {
+    const { message, signature, publicKey } = payload;
+
+    // 1. Basic signature verification
+    const messageBytes = new TextEncoder().encode(message);
+    const signatureBytes = Buffer.from(signature, 'base64');
+    const publicKeyBytes = new PublicKey(publicKey).toBytes();
+
+    const isSignatureValid = await ed.verify(signatureBytes, messageBytes, publicKeyBytes);
+    if (!isSignatureValid) {
+      return { valid: false, error: 'Invalid signature' };
+    }
+
+    // 2. Parse message for timestamp and nonce
+    // Expected message format: "ACTION:timestamp:nonce:extra_data"
+    const parts = message.split(':');
+    if (parts.length < 3) {
+      return { valid: false, error: 'Invalid message format' };
+    }
+
+    const [action, timestampStr, nonce] = parts;
+    const timestamp = parseInt(timestampStr, 10);
+
+    // 3. Timestamp validation (must be within last 5 minutes)
+    const now = Math.floor(Date.now() / 1000);
+    const fiveMinutesAgo = now - 300;
+
+    if (timestamp < fiveMinutesAgo || timestamp > now + 60) {
+      return { valid: false, error: 'Timestamp out of acceptable window' };
+    }
+
+    // 4. Nonce validation (prevent replay attacks)
+    const nonceKey = `nonce:${publicKey}:${nonce}`;
+    const usedNonce = await getCache(nonceKey);
+
+    if (usedNonce) {
+      return { valid: false, error: 'Nonce already used (replay attack detected)' };
+    }
+
+    // Store nonce temporarily
+    await setCache(nonceKey, 'used', NONCE_TTL_SECONDS);
+
+    // 5. Optional action validation
+    if (expectedAction && action !== expectedAction) {
+      return { valid: false, error: `Expected action: ${expectedAction}` };
+    }
+
+    return {
+      valid: true,
+      signer: publicKey,
+    };
+  } catch (error) {
+    console.error('[Solana Verification] Error:', error);
+    return { valid: false, error: 'Verification failed' };
+  }
+}
+
+/**
+ * Simple version without nonce (for lower security actions)
+ */
+export async function verifySolanaSignature(payload: SolanaSignaturePayload): Promise<boolean> {
+  try {
+    const messageBytes = new TextEncoder().encode(payload.message);
+    const signatureBytes = Buffer.from(payload.signature, 'base64');
+    const publicKeyBytes = new PublicKey(payload.publicKey).toBytes();
+
+    return await ed.verify(signatureBytes, messageBytes, publicKeyBytes);
+  } catch (error) {
+    return false;
+  }
+}
+const result = await verifySolanaActionWithNonce({
+  message: `WITHDRAW:${Date.now()}:${crypto.randomUUID()}:100000000`,
+  signature: "...",
+  publicKey: "..."
+}, "WITHDRAW");
+
+if (!result.valid) {
+  return res.status(401).json({ error: result.error });
+}
+use axum::{extract::State, Json};
+use serde::Deserialize;
+use helius::types::{GetAssetRequest, GetAssetProofRequest};
+
+#[derive(Deserialize)]
+pub struct ClaimRequest {
+    pub user: String,        // User's public key
+    pub reward_id: String,   // Identifier for the reward (e.g. game round + rank)
+}
+
+pub async fn claim_compressed_nft(
+    State(state): State<crate::AppState>,
+    Json(payload): Json<ClaimRequest>,
+) -> Json<serde_json::Value> {
+    // In production, you would verify eligibility here (e.g. from Redis/DB)
+    // For now we assume the caller is eligible
+
+    // Example: Use reward_id to determine which compressed NFT to claim
+    // This would normally come from your game/reward system
+    let asset_id = format!("compressed-reward-{}", payload.reward_id); // placeholder
+
+    // Get asset + proof from Helius
+    let asset_request = GetAssetRequest {
+        id: asset_id.clone(),
+        display_options: None,
+    };
+
+    let proof_request = GetAssetProofRequest {
+        id: asset_id,
+    };
+
+    let asset = match state.helius.rpc().get_asset(asset_request).await {
+        Ok(a) => a,
+        Err(e) => return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Failed to fetch asset: {}", e)
+        })),
+    };
+
+    let proof = match state.helius.rpc().get_asset_proof(proof_request).await {
+        Ok(p) => p,
+        Err(e) => return Json(serde_json::json!({
+            "success": false,
+            "error": format!("Failed to fetch proof: {}", e)
+        })),
+    };
+
+    Json(serde_json::json!({
+        "success": true,
+        "asset": asset,
+        "proof": proof,
+        "message": "Use this data to construct Bubblegum claim transaction on frontend"
+    }))
+}
+.route("/claim/compressed-nft", post(handlers::claim::claim_compressed_nft))
+import { createTransferInstruction } from '@metaplex-foundation/mpl-bubblegum';
+
+// Use the proof and asset data returned from the endpoint
+const ix = createTransferInstruction({
+  // ... construct using proof.root, proof.proof, asset, etc.
+});
+import express from 'express';
+
+const router = express.Router();
+
+router.post('/compressed-nft', async (req, res, next) => {
+  try {
+    const { user, reward_id } = req.body;
+
+    // Proxy to Rust microservice
+    const rustResponse = await fetch('http://helius-service:8080/claim/compressed-nft', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user, reward_id }),
+    });
+
+    const data = await rustResponse.json();
+
+    if (!data.success) {
+      return res.status(400).json(data);
+    }
+
+    res.json(data);
+  } catch (error) {
+    next(error);
+  }
+});
+
+export default router;
+'use client';
+
+import { useState } from 'react';
+import { useWallet } from '@solana/wallet-adapter-react';
+import { Connection, Transaction } from '@solana/web3.js';
+import { 
+  createTransferInstruction, 
+  getAssetWithProof 
+} from '@metaplex-foundation/mpl-bubblegum';
+import { publicKey } from '@metaplex-foundation/umi';
+import { createUmi } from '@metaplex-foundation/umi-bundle-defaults';
+
+export function useClaimCompressedNFT() {
+  const { publicKey, sendTransaction } = useWallet();
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const claimCompressedNFT = async (rewardId: string) => {
+    if (!publicKey) {
+      setError('Wallet not connected');
+      return;
+    }
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      // 1. Call backend (which proxies to Rust)
+      const res = await fetch('/api/claim/compressed-nft', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user: publicKey.toBase58(),
+          reward_id: rewardId,
+        }),
+      });
+
+      const { success, asset, proof } = await res.json();
+
+      if (!success) throw new Error('Failed to get claim data');
+
+      // 2. Setup Umi + Bubblegum
+      const umi = createUmi(process.env.NEXT_PUBLIC_SOLANA_RPC!);
+      const assetWithProof = await getAssetWithProof(umi, {
+        asset: publicKey(asset.id),
+        proof: proof.proof.map((p: string) => publicKey(p)),
+      });
+
+      // 3. Create transfer/claim instruction (example using transfer)
+      const instruction = createTransferInstruction(umi, {
+        ...assetWithProof,
+        leafOwner: publicKey(publicKey.toBase58()),
+        newLeafOwner: publicKey(publicKey.toBase58()), // or another recipient
+      });
+
+      // 4. Build and send transaction
+      const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC!);
+      const transaction = new Transaction().add(instruction);
+
+      const signature = await sendTransaction(transaction, connection);
+      await connection.confirmTransaction(signature, 'confirmed');
+
+      return signature;
+    } catch (err: any) {
+      setError(err.message);
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return { claimCompressedNFT, isLoading, error };
+}
+import claimRouter from './routes/claim';
+app.use('/api/claim', claimRouter);
+'use client';
+
+import { useState } from 'react';
+import { useWallet } from '@solana/wallet-adapter-react';
+import { Connection, Transaction } from '@solana/web3.js';
+import { 
+  createTransferInstruction, 
+  getAssetWithProof 
+} from '@metaplex-foundation/mpl-bubblegum';
+import { publicKey } from '@metaplex-foundation/umi';
+import { createUmi } from '@metaplex-foundation/umi-bundle-defaults';
+
+export function useClaimCompressedNFT() {
+  const { publicKey, sendTransaction } = useWallet();
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const claimCompressedNFT = async (rewardId: string) => {
+    if (!publicKey) {
+      setError('Wallet not connected');
+      return;
+    }
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      // 1. Call backend (which proxies to Rust)
+      const res = await fetch('/api/claim/compressed-nft', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user: publicKey.toBase58(),
+          reward_id: rewardId,
+        }),
+      });
+
+      const { success, asset, proof } = await res.json();
+
+      if (!success) throw new Error('Failed to get claim data');
+
+      // 2. Setup Umi + Bubblegum
+      const umi = createUmi(process.env.NEXT_PUBLIC_SOLANA_RPC!);
+      const assetWithProof = await getAssetWithProof(umi, {
+        asset: publicKey(asset.id),
+        proof: proof.proof.map((p: string) => publicKey(p)),
+      });
+
+      // 3. Create transfer/claim instruction (example using transfer)
+      const instruction = createTransferInstruction(umi, {
+        ...assetWithProof,
+        leafOwner: publicKey(publicKey.toBase58()),
+        newLeafOwner: publicKey(publicKey.toBase58()), // or another recipient
+      });
+
+      // 4. Build and send transaction
+      const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC!);
+      const transaction = new Transaction().add(instruction);
+
+      const signature = await sendTransaction(transaction, connection);
+      await connection.confirmTransaction(signature, 'confirmed');
+
+      return signature;
+    } catch (err: any) {
+      setError(err.message);
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return { claimCompressedNFT, isLoading, error };
+}
+const { claimCompressedNFT, isLoading } = useClaimCompressedNFT();
+
+const handleClaim = async () => {
+  try {
+    const sig = await claimCompressedNFT('round-42-rank-1');
+    console.log('Claimed! Signature:', sig);
+  } catch (e) {
+    console.error(e);
+  }
+};
+'use client';
+
+import { useState } from 'react';
+import { useWallet } from '@solana/wallet-adapter-react';
+import { 
+  createUmi 
+} from '@metaplex-foundation/umi-bundle-defaults';
+import { 
+  publicKey, 
+  createSignerFromWalletAdapter 
+} from '@metaplex-foundation/umi';
+import { 
+  createTransferInstruction 
+} from '@metaplex-foundation/mpl-bubblegum';
+import { Connection, Transaction } from '@solana/web3.js';
+
+export function useClaimCompressedNFT() {
+  const { publicKey: walletPublicKey, sendTransaction } = useWallet();
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const claimCompressedNFT = async (rewardId: string) => {
+    if (!walletPublicKey) {
+      setError('Wallet not connected');
+      return;
+    }
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      // 1. Get asset + proof from backend (proxies to Rust)
+      const res = await fetch('/api/claim/compressed-nft', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user: walletPublicKey.toBase58(),
+          reward_id: rewardId,
+        }),
+      });
+
+      const { success, asset, proof } = await res.json();
+      if (!success) throw new Error('Failed to fetch claim data');
+
+      // 2. Setup Umi
+      const umi = createUmi(process.env.NEXT_PUBLIC_SOLANA_RPC!);
+      const umiPublicKey = publicKey(walletPublicKey.toBase58());
+
+      // 3. Prepare asset with proof (correct format)
+      const assetWithProof = {
+        leafOwner: umiPublicKey,
+        leafDelegate: umiPublicKey,
+        merkleTree: publicKey(asset.compression.tree),
+        root: publicKey(proof.root),
+        dataHash: publicKey(asset.compression.data_hash),
+        creatorHash: publicKey(asset.compression.creator_hash),
+        nonce: asset.compression.leaf_id,
+        index: asset.compression.leaf_id,
+        proof: proof.proof.map((p: string) => publicKey(p)),
+      };
+
+      // 4. Create transfer instruction (claim = transfer to self or recipient)
+      const instruction = createTransferInstruction(umi, {
+        ...assetWithProof,
+        newLeafOwner: umiPublicKey, // Change this if claiming to another wallet
+      });
+
+      // 5. Build and send transaction
+      const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC!);
+      const transaction = new Transaction().add(instruction);
+
+      const signature = await sendTransaction(transaction, connection);
+      await connection.confirmTransaction(signature, 'confirmed');
+
+      return signature;
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || 'Claim failed');
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return { claimCompressedNFT, isLoading, error };
+}
+'use client';
+
+import { useState } from 'react';
+import { useWallet } from '@solana/wallet-adapter-react';
+import { 
+  createUmi 
+} from '@metaplex-foundation/umi-bundle-defaults';
+import { 
+  publicKey, 
+  createNoopSigner,
+  transactionBuilder 
+} from '@metaplex-foundation/umi';
+import { 
+  createTransferInstruction 
+} from '@metaplex-foundation/mpl-bubblegum';
+import { Connection } from '@solana/web3.js';
+
+export function useClaimCompressedNFT() {
+  const { publicKey: walletPublicKey, signTransaction } = useWallet();
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const claimCompressedNFT = async (rewardId: string) => {
+    if (!walletPublicKey) {
+      setError('Wallet not connected');
+      return;
+    }
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      // 1. Get asset + proof from backend
+      const res = await fetch('/api/claim/compressed-nft', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user: walletPublicKey.toBase58(),
+          reward_id: rewardId,
+        }),
+      });
+
+      const { success, asset, proof } = await res.json();
+      if (!success) throw new Error('Failed to get claim data');
+
+      // 2. Setup Umi
+      const umi = createUmi(process.env.NEXT_PUBLIC_SOLANA_RPC!);
+      const signer = createNoopSigner(publicKey(walletPublicKey.toBase58()));
+
+      // 3. Prepare asset with proof
+      const assetWithProof = {
+        leafOwner: publicKey(walletPublicKey.toBase58()),
+        leafDelegate: publicKey(walletPublicKey.toBase58()),
+        merkleTree: publicKey(asset.compression.tree),
+        root: publicKey(proof.root),
+        dataHash: publicKey(asset.compression.data_hash),
+        creatorHash: publicKey(asset.compression.creator_hash),
+        nonce: asset.compression.leaf_id,
+        index: asset.compression.leaf_id,
+        proof: proof.proof.map((p: string) => publicKey(p)),
+      };
+
+      // 4. Build instruction using Umi
+      const instruction = createTransferInstruction(umi, {
+        ...assetWithProof,
+        newLeafOwner: publicKey(walletPublicKey.toBase58()),
+      });
+
+      // 5. Use Umi Transaction Builder (recommended)
+      const txBuilder = transactionBuilder()
+        .add(instruction);
+
+      // 6. Build, sign and send
+      const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC!);
+      const tx = await txBuilder.buildAndSign(umi);
+
+      // Convert Umi transaction to web3.js Transaction for wallet adapter
+      const web3Tx = Transaction.from(tx.serialize());
+
+      const signature = await signTransaction(web3Tx);
+      const txid = await connection.sendRawTransaction(signature.serialize());
+      await connection.confirmTransaction(txid, 'confirmed');
+
+      return txid;
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message);
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return { claimCompressedNFT, isLoading, error };
+}
+{
+  "name": "LUMINEX Reward #42",
+  "symbol": "LUM",
+  "description": "Reward for winning Pumpcade Round 42",
+  "image": "https://arweave.net/...",
+  "animation_url": "...",
+  "external_url": "...",
+  "attributes": [
+    { "trait_type": "Rank", "value": "1" },
+    { "trait_type": "Round", "value": "42" }
+  ],
+  "properties": {
+    "files": [...],
+    "category": "image"
+  },
+  "collection": {
+    "name": "LUMINEX Rewards",
+    "family": "NexusCore"
+  },
+  "creators": [
+    {
+      "address": "YourCreatorWallet...",
+      "verified": true,
+      "share": 100
+    }
+  ]
+}
+'use client';
+
+import { useState } from 'react';
+import { useWallet } from '@solana/wallet-adapter-react';
+import { 
+  createUmi 
+} from '@metaplex-foundation/umi-bundle-defaults';
+import { 
+  publicKey, 
+  createNoopSigner,
+  transactionBuilder 
+} from '@metaplex-foundation/umi';
+import { 
+  createTransferInstruction 
+} from '@metaplex-foundation/mpl-bubblegum';
+import { Connection } from '@solana/web3.js';
+
+export function useClaimCompressedNFT() {
+  const { publicKey: walletPublicKey, signTransaction } = useWallet();
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const claimCompressedNFT = async (rewardId: string) => {
+    if (!walletPublicKey) {
+      setError('Wallet not connected');
+      return;
+    }
+
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      // 1. Fetch asset + proof from backend
+      const res = await fetch('/api/claim/compressed-nft', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user: walletPublicKey.toBase58(),
+          reward_id: rewardId,
+        }),
+      });
+
+      const { success, asset, proof } = await res.json();
+      if (!success) throw new Error('Failed to fetch claim data');
+
+      // 2. Initialize Umi
+      const umi = createUmi(process.env.NEXT_PUBLIC_SOLANA_RPC!);
+      const signer = createNoopSigner(publicKey(walletPublicKey.toBase58()));
+
+      // 3. Build optimized asset with proof (Canopy already handled by Helius)
+      const assetWithProof = {
+        leafOwner: publicKey(walletPublicKey.toBase58()),
+        leafDelegate: publicKey(walletPublicKey.toBase58()),
+        merkleTree: publicKey(asset.compression.tree),
+        root: publicKey(proof.root),
+        dataHash: publicKey(asset.compression.data_hash),
+        creatorHash: publicKey(asset.compression.creator_hash),
+        nonce: asset.compression.leaf_id,
+        index: asset.compression.leaf_id,
+        proof: proof.proof.map((p: string) => publicKey(p)),
+      };
+
+      // 4. Create transfer instruction using Umi
+      const transferInstruction = createTransferInstruction(umi, {
+        ...assetWithProof,
+        newLeafOwner: publicKey(walletPublicKey.toBase58()),
+      });
+
+      // 5. Use Umi Transaction Builder (Best Practice)
+      const txBuilder = transactionBuilder()
+        .add(transferInstruction);
+
+      // 6. Build and sign using Umi
+      const builtTx = await txBuilder.buildAndSign(umi);
+
+      // Convert to web3.js Transaction for wallet adapter compatibility
+      const web3Transaction = Transaction.from(builtTx.serialize());
+
+      // 7. Send transaction
+      const connection = new Connection(process.env.NEXT_PUBLIC_SOLANA_RPC!);
+      const signature = await signTransaction(web3Transaction);
+      const txid = await connection.sendRawTransaction(signature.serialize());
+      await connection.confirmTransaction(txid, 'confirmed');
+
+      return txid;
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || 'Claim failed');
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return { claimCompressedNFT, isLoading, error };
+}
 
 
 
